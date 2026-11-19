@@ -14,6 +14,8 @@ DESCRIPTION = """逐笔成交供数 API。
 * `GET /v1/symbols/{symbol}/bars` 风控首次查询：全量分钟柱 + 游标
 * `GET /v1/symbols/{symbol}/changes?cursor=N` 之后用游标续拉变动分钟
   （跨分钟更正会交付两个分钟的变化；最后一笔撤销返回 delete 删除标记）
+* `POST /v1/symbols/{symbol}/journal/reclaim` 按股票回收变更日志，只保留最近 N 条
+  （N=0 清空）；被回收游标续拉返回 410，提示重新快照，其他股票不受影响
 """
 
 
@@ -74,7 +76,10 @@ def create_app(db_path: str) -> FastAPI:
     @app.get(
         "/v1/symbols/{symbol}/changes",
         response_model=models.ChangesPage,
-        responses={409: {"description": "游标超过已提交水位，需要重新快照"}},
+        responses={
+            409: {"description": "游标超过已提交水位，需要重新快照"},
+            410: {"description": "游标已被日志回收（低于该股票回收水位），需要重新快照"},
+        },
         summary="用游标续拉变动分钟",
     )
     def get_changes(
@@ -87,6 +92,16 @@ def create_app(db_path: str) -> FastAPI:
             return logic.pull_changes(conn, symbol, cursor, limit)
         except logic.CursorAheadError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
+        except logic.CursorExpiredError as exc:
+            raise HTTPException(status_code=410, detail=str(exc))
+
+    @app.post(
+        "/v1/symbols/{symbol}/journal/reclaim",
+        response_model=models.ReclaimResult,
+        summary="回收该股票的变更日志（按条数保留，keep=0 清空）",
+    )
+    def reclaim_journal(symbol: str, req: models.ReclaimRequest, conn=Depends(get_conn)):
+        return logic.reclaim_journal(conn, symbol, req.keep)
 
     return app
 

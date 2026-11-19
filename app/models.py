@@ -96,6 +96,29 @@ class ChangesPage(BaseModel):
     changes: list[MinuteChange]
 
 
+class ReclaimRequest(BaseModel):
+    """日志回收请求：按股票只保留最近 keep 条变更日志（keep=0 即全部清空）。"""
+
+    keep: int = Field(
+        ge=0,
+        le=1_000_000_000,
+        description="该股票保留的最近日志条数；0 表示清空该股票的全部日志",
+    )
+
+
+class ReclaimResult(BaseModel):
+    symbol: str = Field(description="被回收日志的股票代码")
+    keep: int = Field(description="请求保留的最近日志条数（0=全部清空）")
+    deleted_count: int = Field(description="本次实际删除的日志条数")
+    reclaim_watermark: int = Field(
+        description="该股票当前的回收水位（已删除日志的最大 seq）；"
+        "游标 <= 该水位的续拉请求会被 410 拒绝并提示重新快照"
+    )
+    global_high_water: int = Field(
+        description="全局已提交水位（历史最大 seq），日志清空后仍保留，新成交序号在此之上继续递增"
+    )
+
+
 class TradeState(BaseModel):
     symbol: str
     trade_no: str

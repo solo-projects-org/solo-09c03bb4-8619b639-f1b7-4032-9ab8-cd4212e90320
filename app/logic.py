@@ -43,6 +43,26 @@ class CursorAheadError(Exception):
         )
 
 
+class CursorExpiredError(Exception):
+    """Client cursor is at/below this symbol's reclaim watermark -> HTTP 410.
+
+    The journal rows the cursor would continue from have been reclaimed, so
+    the client must take a fresh snapshot before pulling changes again.
+    """
+
+    def __init__(self, cursor: int, watermark: int, symbol: str):
+        self.cursor = cursor
+        self.watermark = watermark
+        self.symbol = symbol
+        super().__init__(
+            f"股票 {symbol} 的游标 {cursor} 已低于日志回收水位 {watermark}，"
+            "对应变更日志已被回收，请重新获取快照"
+        )
+
+
+HIGH_WATER_KEY = "journal_high_water"
+
+
 def minute_floor(ts_ms: int) -> int:
     return ts_ms - (ts_ms % MINUTE_MS)
 
@@ -257,12 +277,22 @@ def _journal(
     change_type: str,
     bar: Optional[dict],
 ) -> None:
-    conn.execute(
+    cur = conn.execute(
         """
         INSERT INTO journal (symbol, minute_start_utc_ms, change_type, bar_json)
         VALUES (?, ?, ?, ?)
         """,
         (symbol, minute_ms, change_type, None if bar is None else json.dumps(bar, sort_keys=True)),
+    )
+    # Advance the durable global watermark in the SAME transaction. It records
+    # the largest seq ever committed, so it survives even a full journal
+    # reclaim and lets snapshots keep returning a committed global cursor.
+    conn.execute(
+        """
+        INSERT INTO meta (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = MAX(value, excluded.value)
+        """,
+        (HIGH_WATER_KEY, cur.lastrowid),
     )
 
 
@@ -270,11 +300,108 @@ def _journal(
 # queries
 # ---------------------------------------------------------------------------
 
+def _high_water(conn: sqlite3.Connection) -> int:
+    """Largest journal seq ever committed (durable even if the journal is empty)."""
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key = ?", (HIGH_WATER_KEY,)
+    ).fetchone()
+    return 0 if row is None else row["value"]
+
+
+def _symbol_watermark(conn: sqlite3.Connection, symbol: str) -> int:
+    """Reclaim watermark of one symbol: rows with seq <= it no longer exist."""
+    row = conn.execute(
+        "SELECT watermark_seq FROM reclaim_watermarks WHERE symbol = ?",
+        (symbol,),
+    ).fetchone()
+    return 0 if row is None else row["watermark_seq"]
+
+
+def reclaim_journal(conn: sqlite3.Connection, symbol: str, keep: int) -> dict[str, Any]:
+    """Reclaim one symbol's change log, keeping only its newest `keep` rows.
+
+    Deletes journal rows strictly older than the keep boundary and advances
+    the symbol's durable reclaim watermark to the largest deleted seq
+    (0 when there was nothing to delete). Everything runs in ONE immediate
+    transaction together with the watermark update: any failure rolls back,
+    leaving both the original log and the watermark untouched.
+
+    Other symbols' rows and watermarks are never touched, so their cursors
+    never get false "expired" errors. The global high-water mark is also
+    untouched; AUTOINCREMENT keeps handing out fresh, ever-increasing seq
+    values after the journal is emptied.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        previous = _symbol_watermark(conn, symbol)
+
+        # Largest seq that must be deleted: with keep=0 it is simply the
+        # symbol's maximum seq; otherwise it is the seq keep positions back.
+        # Returns no row when the symbol does not even have `keep` rows.
+        boundary_row = conn.execute(
+            """
+            SELECT seq FROM journal
+            WHERE symbol = ?
+            ORDER BY seq DESC
+            LIMIT 1 OFFSET ?
+            """,
+            (symbol, keep),
+        ).fetchone()
+
+        if boundary_row is None or boundary_row["seq"] <= previous:
+            # Nothing beyond the retention window. The watermark may still be
+            # positive from an earlier reclaim: report it without changing it.
+            conn.execute("COMMIT")
+            return {
+                "symbol": symbol,
+                "keep": keep,
+                "deleted_count": 0,
+                "reclaim_watermark": previous,
+                "global_high_water": _high_water(conn),
+            }
+
+        boundary = boundary_row["seq"]
+        deleted = conn.execute(
+            "DELETE FROM journal WHERE symbol = ? AND seq <= ?",
+            (symbol, boundary),
+        ).rowcount
+
+        conn.execute(
+            """
+            INSERT INTO reclaim_watermarks (symbol, watermark_seq, reclaimed_at)
+            VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            ON CONFLICT(symbol) DO UPDATE SET
+                watermark_seq = MAX(reclaim_watermarks.watermark_seq, excluded.watermark_seq),
+                reclaimed_at  = excluded.reclaimed_at
+            """,
+            (symbol, boundary),
+        )
+
+        result = {
+            "symbol": symbol,
+            "keep": keep,
+            "deleted_count": deleted,
+            "reclaim_watermark": boundary,
+            "global_high_water": _high_water(conn),
+        }
+        conn.execute("COMMIT")
+        return result
+    except Exception:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+
+
 def snapshot_bars(conn: sqlite3.Connection, symbol: str) -> dict[str, Any]:
-    """First query: all current minute bars plus a cursor consistent with them."""
+    """First query: all current minute bars plus a cursor consistent with them.
+
+    The cursor is the durable GLOBAL high-water mark (largest seq ever
+    committed), so it stays valid and non-zero even after the whole journal
+    has been reclaimed. Bars and cursor are read in one read transaction.
+    """
     conn.execute("BEGIN")
     try:
-        cursor = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM journal").fetchone()[0]
+        cursor = _high_water(conn)
         rows = conn.execute(
             "SELECT * FROM minute_bars WHERE symbol = ? ORDER BY minute_start_utc_ms",
             (symbol,),
@@ -294,10 +421,27 @@ def snapshot_bars(conn: sqlite3.Connection, symbol: str) -> dict[str, Any]:
 def pull_changes(
     conn: sqlite3.Connection, symbol: str, cursor: int, limit: int
 ) -> dict[str, Any]:
-    """Incremental pull: committed changes for one symbol with seq > cursor."""
+    """Incremental pull: committed changes for one symbol with seq > cursor.
+
+    All checks and reads happen in one read transaction, so the returned
+    changes always correspond to one consistent view of the journal and both
+    watermarks:
+      * cursor <= this symbol's reclaim watermark -> 410 CursorExpiredError,
+        the rows it builds on have been reclaimed; take a fresh snapshot.
+      * cursor > global high-water mark -> 409 CursorAheadError as before.
+      * otherwise only surviving rows of THIS symbol are delivered, so
+        reclaiming another symbol can never produce a false expiry here.
+    """
     conn.execute("BEGIN")
     try:
-        max_seq = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM journal").fetchone()[0]
+        max_seq = _high_water(conn)
+        watermark = _symbol_watermark(conn, symbol)
+        # Reclaim deletes rows with seq <= watermark, so a cursor strictly
+        # below the watermark can no longer be continued. A cursor equal to
+        # the watermark simply starts after the last deleted row and stays
+        # valid (also keeps cursor=0 working before any reclaim).
+        if cursor < watermark:
+            raise CursorExpiredError(cursor, watermark, symbol)
         if cursor > max_seq:
             raise CursorAheadError(cursor, max_seq)
         rows = conn.execute(
