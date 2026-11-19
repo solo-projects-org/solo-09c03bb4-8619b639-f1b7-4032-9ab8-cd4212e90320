@@ -1,0 +1,8 @@
+.git
+.pytest_cache
+tests
+conftest.py
+__pycache__
+*.pyc
+feed.db*
+README.md

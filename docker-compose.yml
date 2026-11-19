@@ -1,0 +1,15 @@
+services:
+  feed-api:
+    build: .
+    image: trade-feed-api:latest
+    container_name: trade-feed-api
+    ports:
+      - "8000:8000"
+    environment:
+      FEED_DB_PATH: /data/feed.db
+    volumes:
+      - feed-data:/data
+    restart: unless-stopped
+
+volumes:
+  feed-data:
